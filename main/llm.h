@@ -15,6 +15,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "spi_flash_mmap.h"
 
 typedef float v4sf __attribute__((aligned(16)));
 
@@ -98,10 +99,10 @@ typedef struct {
     Config config; // the hyperparameters of the architecture (the blueprint)
     TransformerWeights weights; // the weights of the model
     RunState state; // buffers for the "wave" of activations in the forward pass
-    // some more state needed to properly clean up the memory mapping (sigh)
-    int fd; // file descriptor for memory mapping
-    v4sf* data; // memory mapped data pointer
-    size_t file_size; // size of the checkpoint file in bytes
+    int fd;
+    const v4sf* data; // flash-mapped data pointer (read-only)
+    size_t file_size;
+    spi_flash_mmap_handle_t mmap_handle;
 } Transformer;
 
 

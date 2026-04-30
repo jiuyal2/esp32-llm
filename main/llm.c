@@ -18,10 +18,10 @@
 #include "esp_system.h"
 #include "esp_dsp.h"
 #include "esp_attr.h"
+#include "esp_partition.h"
+#include "spi_flash_mmap.h"
 
-#define MAP_FAILED NULL
-#define munmap(ptr, length) custom_munmap(ptr)
-#define close(fd) custom_close(fd)
+#define MAX_SEQ_LEN 128  // cap KV cache to fit in 512KB internal RAM
 
 #define TASK_0_BIT (1 << 0)
 #define TASK_1_BIT (1 << 1)
@@ -76,17 +76,6 @@ SemaphoreHandle_t semaForwardDataReady;
 void matmul_task(void *params);
 void forward_task(void *params);
 
-void custom_munmap(void *ptr)
-{
-    free(ptr);
-}
-
-int custom_close(int fd)
-{
-    // Since there are no actual file descriptors to close, simply return 0 (success)
-    return 0;
-}
-
 void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
           char *cli_user_prompt, char *cli_system_prompt, int steps);
 
@@ -126,90 +115,82 @@ void free_run_state(RunState *s)
     free(s->value_cache);
 }
 
-void memory_map_weights(TransformerWeights *w, Config *p, v4sf *ptr, int shared_weights)
+void memory_map_weights(TransformerWeights *w, Config *p, const v4sf *ptr, int shared_weights)
 {
     int head_size = p->dim / p->n_heads;
-    // make sure the multiplications below are done in 64bit to fit the parameter counts of 13B+ models
     unsigned long long n_layers = p->n_layers;
-    w->token_embedding_table = ptr;
+    // Cast away const: weights live in read-only flash, inference never writes them
+    w->token_embedding_table = (v4sf *)ptr;
     ptr += p->vocab_size * p->dim;
-    w->rms_att_weight = ptr;
+    w->rms_att_weight = (v4sf *)ptr;
     ptr += n_layers * p->dim;
-    w->wq = ptr;
+    w->wq = (v4sf *)ptr;
     ptr += n_layers * p->dim * (p->n_heads * head_size);
-    w->wk = ptr;
+    w->wk = (v4sf *)ptr;
     ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-    w->wv = ptr;
+    w->wv = (v4sf *)ptr;
     ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-    w->wo = ptr;
+    w->wo = (v4sf *)ptr;
     ptr += n_layers * (p->n_heads * head_size) * p->dim;
-    w->rms_ffn_weight = ptr;
+    w->rms_ffn_weight = (v4sf *)ptr;
     ptr += n_layers * p->dim;
-    w->w1 = ptr;
+    w->w1 = (v4sf *)ptr;
     ptr += n_layers * p->dim * p->hidden_dim;
-    w->w2 = ptr;
+    w->w2 = (v4sf *)ptr;
     ptr += n_layers * p->hidden_dim * p->dim;
-    w->w3 = ptr;
+    w->w3 = (v4sf *)ptr;
     ptr += n_layers * p->dim * p->hidden_dim;
-    w->rms_final_weight = ptr;
+    w->rms_final_weight = (v4sf *)ptr;
     ptr += p->dim;
-    ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE)
-    ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
-    w->wcls = shared_weights ? w->token_embedding_table : ptr;
+    ptr += p->seq_len * head_size / 2;
+    ptr += p->seq_len * head_size / 2;
+    w->wcls = shared_weights ? w->token_embedding_table : (v4sf *)ptr;
 }
 
-void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weights,
-                     int *fd, v4sf **data, size_t *file_size)
+void read_checkpoint(Config *config, TransformerWeights *weights,
+                     const v4sf **data, size_t *file_size,
+                     spi_flash_mmap_handle_t *mmap_handle)
 {
-    FILE *file = fopen(checkpoint, "rb");
-    if (!file)
+    const esp_partition_t *part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, 0xFF, "model");
+    if (!part)
     {
-        ESP_LOGE(TAG, "Couldn't open file %s", checkpoint);
+        ESP_LOGE(TAG, "Model flash partition not found");
         exit(EXIT_FAILURE);
     }
-    // read in the config header
-    if (fread(config, sizeof(Config), 1, file) != 1)
+
+    const void *mapped_ptr;
+    esp_err_t err = esp_partition_mmap(part, 0, part->size,
+                                       ESP_PARTITION_MMAP_DATA,
+                                       &mapped_ptr, mmap_handle);
+    if (err != ESP_OK)
     {
+        ESP_LOGE(TAG, "Flash mmap failed: %s", esp_err_to_name(err));
         exit(EXIT_FAILURE);
     }
-    // negative vocab size is hacky way of signaling unshared weights. bit yikes.
+
+    // Config is the first bytes of the model file
+    memcpy(config, mapped_ptr, sizeof(Config));
     int shared_weights = config->vocab_size > 0 ? 1 : 0;
     config->vocab_size = abs(config->vocab_size);
-    ESP_LOGI(TAG, "Vocab size if %d", config->vocab_size);
-    // figure out the file size
-    fseek(file, 0, SEEK_END); // move file pointer to end of file
-    *file_size = ftell(file); // get the file size, in bytes
-    fseek(file, 0, SEEK_SET); // move back to beginning for reading
-    ESP_LOGI(TAG, "File size: %zu bytes", *file_size);
-    ESP_LOGI(TAG, "Free ram available: %lu", esp_get_free_heap_size());
-    *data = malloc(*file_size);
-    if (*data == NULL)
-    {
-        ESP_LOGE(TAG, "Malloc operation failed");
-        exit(EXIT_FAILURE);
-    }
-    // Read the entire file into memory
-    size_t bytes_read = fread(*data, 1, *file_size, file);
-    if (bytes_read != *file_size)
-    {
-        ESP_LOGE(TAG, "Failed to read file into memory");
-        ESP_LOGE(TAG, "Bytes read %zu bytes", bytes_read);
-        exit(EXIT_FAILURE);
-    }
-    fclose(file);
+    // Cap sequence length so KV cache fits in internal RAM
+    if (config->seq_len > MAX_SEQ_LEN)
+        config->seq_len = MAX_SEQ_LEN;
 
-    ESP_LOGI(TAG, "Successfully read LLM into memory");
-    ESP_LOGI(TAG, "Free ram available: %lu", esp_get_free_heap_size());
-    v4sf *weights_ptr = *data + sizeof(Config) / sizeof(v4sf);
-    memory_map_weights(weights, config, weights_ptr, shared_weights);
-    ESP_LOGI(TAG, "Successfully read checkpoint");
+    *data = (const v4sf *)mapped_ptr;
+    *file_size = part->size;
+
+    ESP_LOGI(TAG, "Model mapped from flash (0 RAM). Free heap: %lu", esp_get_free_heap_size());
+
+    const v4sf *weights_ptr = *data + sizeof(Config) / sizeof(v4sf);
+    memory_map_weights(weights, config, (v4sf *)weights_ptr, shared_weights);
+    ESP_LOGI(TAG, "Checkpoint loaded. vocab=%d seq_len=%d", config->vocab_size, config->seq_len);
 }
 
 void build_transformer(Transformer *t, char *checkpoint_path)
 {
-    // read in the Config and the Weights from the checkpoint
-    read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
-    // allocate the RunState buffers
+    (void)checkpoint_path; // model is now in flash partition, path unused
+    read_checkpoint(&t->config, &t->weights, &t->data, &t->file_size, &t->mmap_handle);
     malloc_run_state(&t->state, &t->config);
     ESP_LOGI(TAG, "Transformer successfully built");
 
@@ -232,16 +213,8 @@ void build_transformer(Transformer *t, char *checkpoint_path)
 
 void free_transformer(Transformer *t)
 {
-    // close the memory mapping
-    if (t->data != MAP_FAILED)
-    {
-        munmap(t->data, t->file_size);
-    }
-    if (t->fd != -1)
-    {
-        close(t->fd);
-    }
-    // free the RunState buffers
+    if (t->mmap_handle)
+        spi_flash_munmap(t->mmap_handle);
     free_run_state(&t->state);
 }
 
@@ -1084,7 +1057,6 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     {
         long end = time_in_ms();
         float tks = (pos - 1) / (double)(end - start) * 1000;
-        fprintf(stderr, "achieved tok/s: %f\n", tks);
         cb_done(tks);
     }
 
