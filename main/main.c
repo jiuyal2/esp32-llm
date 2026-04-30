@@ -9,6 +9,9 @@
 
 static const char *TAG = "MAIN";
 
+// Set to 1 to auto-run a fixed prompt at startup (useful for debugging)
+#define AUTO_PROMPT 1
+
 void init_storage(void)
 {
     esp_vfs_spiffs_conf_t conf = {
@@ -54,6 +57,14 @@ void app_main(void)
 
     printf("\n\nESP32 TinyLLM  |  seq_len=%d\n", steps);
     printf("Enter a prompt and press Enter. Empty line = free generation.\n");
+
+#if AUTO_PROMPT
+    // auto-run a fixed prompt so we can observe model output without typing
+    char fixed_prompt[] = "once upon a time";
+    printf("\nAuto prompt: %s\n", fixed_prompt);
+    generate(&transformer, &tokenizer, &sampler,
+             fixed_prompt, steps, generate_complete_cb);
+#endif
 
     char prompt[256];
     while (1) {

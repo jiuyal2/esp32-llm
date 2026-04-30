@@ -23,58 +23,7 @@
 
 #define MAX_SEQ_LEN 128  // cap KV cache to fit in 512KB internal RAM
 
-#define TASK_0_BIT (1 << 0)
-#define TASK_1_BIT (1 << 1)
-#define FORWARD_TASK_1 (1 << 2)
-#define FORWARD_TASK_2 (1 << 3)
-#define READY_BIT (1 << 3)
-#define ALL_SYNC_BITS (TASK_0_BIT | TASK_1_BIT)
-#define ALL_FORWARD_TASKS (FORWARD_TASK_1 | FORWARD_TASK_2)
-
-typedef struct
-{
-    v4sf *xout;
-    v4sf *x;
-    v4sf *w;
-    int start;
-    int end;
-    int n;
-    int d;
-    int task_num;
-} MatMulTaskParams;
-
-typedef struct
-{
-    RunState *s;
-    TransformerWeights *w;
-    Config *p;
-    int pos;
-    int start;
-    int loff;
-    int end;
-    int dim;
-    int kv_dim;
-    int kv_mul;
-    int hidden_dim;
-    int head_size;
-    int task_num;
-} ForwardTaskParams;
-
-EventGroupHandle_t xEventGroup;
-EventGroupHandle_t ForwardEventGroup;
-
 static const char *TAG = "LLM";
-TaskHandle_t handle_forward_task = NULL;
-TaskHandle_t matmul_task_2 = NULL;
-
-ForwardTaskParams *forward_params = NULL;
-MatMulTaskParams *matmul_params = NULL;
-
-SemaphoreHandle_t semaDataReady;
-SemaphoreHandle_t semaForwardDataReady;
-
-void matmul_task(void *params);
-void forward_task(void *params);
 
 void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
           char *cli_user_prompt, char *cli_system_prompt, int steps);
@@ -83,16 +32,27 @@ void malloc_run_state(RunState *s, Config *p)
 {
     // we calloc instead of malloc to keep valgrind happy
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    s->x = calloc(p->dim, sizeof(v4sf));
-    s->xb = calloc(p->dim, sizeof(v4sf));
-    s->xb2 = calloc(p->dim, sizeof(v4sf));
-    s->hb = calloc(p->hidden_dim, sizeof(v4sf));
-    s->hb2 = calloc(p->hidden_dim, sizeof(v4sf));
-    s->q = calloc(p->dim, sizeof(v4sf));
-    s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(v4sf));
-    s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(v4sf));
-    s->att = calloc(p->n_heads * p->seq_len, sizeof(v4sf));
-    s->logits = calloc(p->vocab_size, sizeof(v4sf));
+    void *tmp = NULL;
+    if (posix_memalign(&tmp, 16, p->dim * sizeof(v4sf)) != 0) tmp = NULL;
+    s->x = (v4sf *)tmp; if (s->x) memset(s->x, 0, p->dim * sizeof(v4sf));
+    if (posix_memalign(&tmp, 16, p->dim * sizeof(v4sf)) != 0) tmp = NULL;
+    s->xb = (v4sf *)tmp; if (s->xb) memset(s->xb, 0, p->dim * sizeof(v4sf));
+    if (posix_memalign(&tmp, 16, p->dim * sizeof(v4sf)) != 0) tmp = NULL;
+    s->xb2 = (v4sf *)tmp; if (s->xb2) memset(s->xb2, 0, p->dim * sizeof(v4sf));
+    if (posix_memalign(&tmp, 16, p->hidden_dim * sizeof(v4sf)) != 0) tmp = NULL;
+    s->hb = (v4sf *)tmp; if (s->hb) memset(s->hb, 0, p->hidden_dim * sizeof(v4sf));
+    if (posix_memalign(&tmp, 16, p->hidden_dim * sizeof(v4sf)) != 0) tmp = NULL;
+    s->hb2 = (v4sf *)tmp; if (s->hb2) memset(s->hb2, 0, p->hidden_dim * sizeof(v4sf));
+    if (posix_memalign(&tmp, 16, p->dim * sizeof(v4sf)) != 0) tmp = NULL;
+    s->q = (v4sf *)tmp; if (s->q) memset(s->q, 0, p->dim * sizeof(v4sf));
+    if (posix_memalign(&tmp, 16, p->n_layers * p->seq_len * kv_dim * sizeof(v4sf)) != 0) tmp = NULL;
+    s->key_cache = (v4sf *)tmp; if (s->key_cache) memset(s->key_cache, 0, p->n_layers * p->seq_len * kv_dim * sizeof(v4sf));
+    if (posix_memalign(&tmp, 16, p->n_layers * p->seq_len * kv_dim * sizeof(v4sf)) != 0) tmp = NULL;
+    s->value_cache = (v4sf *)tmp; if (s->value_cache) memset(s->value_cache, 0, p->n_layers * p->seq_len * kv_dim * sizeof(v4sf));
+    if (posix_memalign(&tmp, 16, p->n_heads * p->seq_len * sizeof(v4sf)) != 0) tmp = NULL;
+    s->att = (v4sf *)tmp; if (s->att) memset(s->att, 0, p->n_heads * p->seq_len * sizeof(v4sf));
+    if (posix_memalign(&tmp, 16, p->vocab_size * sizeof(v4sf)) != 0) tmp = NULL;
+    s->logits = (v4sf *)tmp; if (s->logits) memset(s->logits, 0, p->vocab_size * sizeof(v4sf));
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q || !s->key_cache || !s->value_cache || !s->att || !s->logits)
     {
@@ -172,10 +132,9 @@ void read_checkpoint(Config *config, TransformerWeights *weights,
     // Config is the first bytes of the model file
     memcpy(config, mapped_ptr, sizeof(Config));
     int shared_weights = config->vocab_size > 0 ? 1 : 0;
+    int checkpoint_seq_len = abs(config->seq_len);
     config->vocab_size = abs(config->vocab_size);
-    // Cap sequence length so KV cache fits in internal RAM
-    if (config->seq_len > MAX_SEQ_LEN)
-        config->seq_len = MAX_SEQ_LEN;
+    config->seq_len = checkpoint_seq_len;
 
     *data = (const v4sf *)mapped_ptr;
     *file_size = part->size;
@@ -184,7 +143,13 @@ void read_checkpoint(Config *config, TransformerWeights *weights,
 
     const v4sf *weights_ptr = *data + sizeof(Config) / sizeof(v4sf);
     memory_map_weights(weights, config, (v4sf *)weights_ptr, shared_weights);
-    ESP_LOGI(TAG, "Checkpoint loaded. vocab=%d seq_len=%d", config->vocab_size, config->seq_len);
+
+    // Cap sequence length only after weight offsets are resolved from the checkpoint layout.
+    if (config->seq_len > MAX_SEQ_LEN)
+        config->seq_len = MAX_SEQ_LEN;
+
+    ESP_LOGI(TAG, "Checkpoint loaded. vocab=%d seq_len=%d (checkpoint seq_len=%d)",
+             config->vocab_size, config->seq_len, checkpoint_seq_len);
 }
 
 void build_transformer(Transformer *t, char *checkpoint_path)
@@ -194,21 +159,11 @@ void build_transformer(Transformer *t, char *checkpoint_path)
     malloc_run_state(&t->state, &t->config);
     ESP_LOGI(TAG, "Transformer successfully built");
 
-    // FreeRTos Tasks
-    xEventGroup = xEventGroupCreate();
-    ForwardEventGroup = xEventGroupCreate();
-    semaDataReady = xSemaphoreCreateBinary();
-    semaForwardDataReady = xSemaphoreCreateBinary();
-    xSemaphoreGive(semaDataReady);
-    xSemaphoreTake(semaDataReady, portMAX_DELAY);
-    xSemaphoreGive(semaForwardDataReady);
-    xSemaphoreTake(semaForwardDataReady, portMAX_DELAY);
-
-    matmul_params = malloc(sizeof(MatMulTaskParams));
-    forward_params = malloc(sizeof(ForwardTaskParams));
-    xTaskCreatePinnedToCore(matmul_task, "MatMul2", 2048, matmul_params, 19, &matmul_task_2, 1);             // Run on Core 1
-    xTaskCreatePinnedToCore(forward_task, "ForwardTask", 2048, forward_params, 19, &handle_forward_task, 1); // Run on Core 1
-    ESP_LOGI(TAG, "Created FreeRTOS Tasks");
+    /* Single-threaded inference. Latency is not a priority on this board
+     * (512 KB SRAM, no PSRAM). The Task WDT is fed by yielding once per
+     * forward() call so IDLE0 gets scheduled. */
+    ESP_LOGI(TAG, "Inference configured (single-threaded). Free heap: %lu",
+             esp_get_free_heap_size());
 }
 
 void free_transformer(Transformer *t)
@@ -264,123 +219,24 @@ void softmax(v4sf *x, int size)
     }
 }
 
-void matmul_task(void *params)
-{
-    const TickType_t xDelay = 1 / portTICK_PERIOD_MS;
-    MatMulTaskParams *p = (MatMulTaskParams *)params;
-    TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
-    char *tName = pcTaskGetName(current_task);
-    // ESP_LOGI(TAG, "Created Task %s", tName);
-    for (;;)
-    {
-        if (xSemaphoreTake(semaDataReady, portMAX_DELAY) == pdTRUE)
-        {
-            //   ESP_LOGI(TAG, "Started Task %s", tName);
-            for (int i = p->start; i < p->end; i++)
-            {
-                v4sf val = 0.0f;
-                v4sf *row = &p->w[i * p->n]; // Pointer to the start of the current row in matrix w
-                dsps_dotprod_f32_aes3(row, p->x, &val, p->n);
-                p->xout[i] = val;
-            }
-            //    ESP_LOGI(TAG, "Completed task %s", tName);
-            xSemaphoreGive(semaDataReady);
-            xEventGroupSync(xEventGroup, p->task_num, ALL_SYNC_BITS, portMAX_DELAY);
-        }
-    }
-}
-
-void forward_task(void *params)
-{
-    const TickType_t xDelay = 1 / portTICK_PERIOD_MS;
-    ForwardTaskParams *t_params = (ForwardTaskParams *)params;
-    TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
-    char *tName = pcTaskGetName(current_task);
-    // ESP_LOGI(TAG, "Created Task %s", tName);
-    for (;;)
-    {
-        if (xSemaphoreTake(semaForwardDataReady, portMAX_DELAY) == pdTRUE)
-        {
-            //   ESP_LOGI(TAG, "Started Task %s", tName);
-            int h;
-            // #pragma omp parallel for private(h)
-            for (h = t_params->start; h < t_params->end; h++)
-            {
-                // get the query vector for this head
-                v4sf *q = t_params->s->q + h * t_params->head_size;
-                // attention scores for this head
-                v4sf *att = t_params->s->att + h * t_params->p->seq_len;
-                // iterate over all timesteps, including the current one
-                for (int t = 0; t <= t_params->pos; t++)
-                {
-                    // get the key vector for this head and at this timestep
-                    v4sf *k = t_params->s->key_cache + t_params->loff + t * t_params->kv_dim + (h / t_params->kv_mul) * t_params->head_size;
-                    // calculate the attention score as the dot product of q and k
-                    v4sf score = 0.0f;
-                    for (int i = 0; i < t_params->head_size; i++)
-                    {
-                        score += q[i] * k[i];
-                    }
-                    score /= sqrtf(t_params->head_size);
-                    // save the score to the attention buffer
-                    att[t] = score;
-                }
-
-                // softmax the scores to get attention weights, from 0..pos inclusively
-                softmax(att, t_params->pos + 1);
-
-                // weighted sum of the values, store back into xb
-                v4sf *xb = t_params->s->xb + h * t_params->head_size;
-                memset(xb, 0, t_params->head_size * sizeof(v4sf));
-                for (int t = 0; t <= t_params->pos; t++)
-                {
-                    // get the value vector for this head and at this timestep
-                    v4sf *v = t_params->s->value_cache + t_params->loff + t * t_params->kv_dim + (h / t_params->kv_mul) * t_params->head_size;
-                    // get the attention weight for this timestep
-                    v4sf a = att[t];
-                    // accumulate the weighted value into xb
-                    for (int i = 0; i < t_params->head_size; i++)
-                    {
-                        xb[i] += a * v[i];
-                    }
-                }
-            }
-            //   ESP_LOGI(TAG, "Completed task %s", tName);
-            xSemaphoreGive(semaForwardDataReady);
-            xEventGroupSync(ForwardEventGroup, t_params->task_num, ALL_FORWARD_TASKS, portMAX_DELAY);
-        }
-    }
-}
-
 void matmul(v4sf *xout, v4sf *x, v4sf *w, int n, int d)
 {
-
-    // d is the number of rows
-    // n is the number of columns
-    // d X n
-    *matmul_params = (MatMulTaskParams){xout, x, w, d / 2, d, n, d, TASK_1_BIT};
-    xSemaphoreGive(semaDataReady);
-    for (int i = 0; i < d / 2; i++)
-    {
+    /* Single-threaded matmul. d rows × n columns. */
+    for (int i = 0; i < d; i++) {
         v4sf val = 0.0f;
-        v4sf *row = &w[i * n]; // Pointer to the start of the current row in matrix w
-        dsps_dotprod_f32_aes3(row, x, &val, n);
+        dsps_dotprod_f32_aes3(&w[i * n], x, &val, n);
         xout[i] = val;
     }
-    if (xSemaphoreTake(semaDataReady, portMAX_DELAY) == pdTRUE)
-    {
-        xEventGroupSync(xEventGroup,
-                        TASK_0_BIT,
-                        ALL_SYNC_BITS,
-                        portMAX_DELAY);
-
-        xEventGroupClearBits(xEventGroup, ALL_SYNC_BITS);
-    }
-    //   ESP_LOGI(TAG, "Completed MatMul tasks");
 }
 
 v4sf *forward(Transformer *transformer, int token, int pos)
 {
+    /* Yield once per forward() so IDLE0 runs and resets the Task WDT.
+     * vTaskDelay(1) blocks for one tick (~10 ms at 100 Hz), which is
+     * enough for IDLE0 to be scheduled. vTaskDelay(0)/taskYIELD() do NOT
+     * feed the WDT because IDLE has lower priority than this task. */
+    vTaskDelay(1);
+
     ESP_LOGD(TAG, "ram available: %lu", esp_get_free_heap_size());
 
     // a few convenience variables
@@ -434,114 +290,64 @@ v4sf *forward(Transformer *transformer, int token, int pos)
                 vec[i + 1] = v0 * fci + v1 * fcr;
             }
         }
-        // start task
-        *forward_params = (ForwardTaskParams){
-            .s = s,
-            .w = w,
-            .p = p,
-            .pos = pos,
-            .start = p->n_heads / 2,
-            .loff = loff,
-            .end = p->n_heads,
-            .dim = dim,
-            .kv_dim = kv_dim,
-            .kv_mul = kv_mul,
-            .hidden_dim = hidden_dim,
-            .head_size = head_size,
-            .task_num = FORWARD_TASK_1,
-        };
-        xSemaphoreGive(semaForwardDataReady);
-
-        // multihead attention. iterate over all heads
-        int h;
-        // #pragma omp parallel for private(h)
-        for (h = 0; h < (p->n_heads / 2); h++)
+        /* Multihead attention over all heads (single-threaded). */
+        for (int h = 0; h < p->n_heads; h++)
         {
-            // get the query vector for this head
-            v4sf *q = s->q + h * head_size;
-            // attention scores for this head
+            v4sf *q   = s->q   + h * head_size;
             v4sf *att = s->att + h * p->seq_len;
-            // iterate over all timesteps, including the current one
             for (int t = 0; t <= pos; t++)
             {
-                // get the key vector for this head and at this timestep
                 v4sf *k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-                // calculate the attention score as the dot product of q and k
                 v4sf score = 0.0f;
-                for (int i = 0; i < head_size; i++)
-                {
-                    score += q[i] * k[i];
-                }
-                score /= sqrtf(head_size);
-                // save the score to the attention buffer
-                att[t] = score;
+                for (int i = 0; i < head_size; i++) score += q[i] * k[i];
+                att[t] = score / sqrtf(head_size);
             }
-
-            // softmax the scores to get attention weights, from 0..pos inclusively
             softmax(att, pos + 1);
-
-            // weighted sum of the values, store back into xb
             v4sf *xb = s->xb + h * head_size;
             memset(xb, 0, head_size * sizeof(v4sf));
             for (int t = 0; t <= pos; t++)
             {
-                // get the value vector for this head and at this timestep
                 v4sf *v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-                // get the attention weight for this timestep
                 v4sf a = att[t];
-                // accumulate the weighted value into xb
-                for (int i = 0; i < head_size; i++)
-                {
-                    xb[i] += a * v[i];
-                }
+                for (int i = 0; i < head_size; i++) xb[i] += a * v[i];
             }
         }
-        if (xSemaphoreTake(semaForwardDataReady, portMAX_DELAY) == pdTRUE)
+
+        // final matmul to get the output of the attention
+        matmul(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim);
+
+        // residual connection back into x
+        for (int i = 0; i < dim; i++)
         {
+            x[i] += s->xb2[i];
+        }
 
-            xEventGroupSync(ForwardEventGroup,
-                            FORWARD_TASK_2,
-                            ALL_FORWARD_TASKS,
-                            portMAX_DELAY);
+        // ffn rmsnorm
+        rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim);
 
-            xEventGroupClearBits(ForwardEventGroup, ALL_FORWARD_TASKS);
+        // FFN in PyTorch: self.w2(F.silu(self.w1(x)) * self.w3(x))
+        // first calculate self.w1(x) and self.w3(x)
+        matmul(s->hb, s->xb, w->w1 + l * dim * hidden_dim, dim, hidden_dim);
+        matmul(s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim);
 
-            // final matmul to get the output of the attention
-            matmul(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim);
+        // SwiGLU non-linearity
+        for (int i = 0; i < hidden_dim; i++)
+        {
+            v4sf val = s->hb[i];
+            // silu(x)=x*sigma(x), where sigma(x) is the logistic sigmoid
+            val *= (1.0f / (1.0f + expf(-val)));
+            // elementwise multiply with w3(x)
+            val *= s->hb2[i];
+            s->hb[i] = val;
+        }
 
-            // residual connection back into x
-            for (int i = 0; i < dim; i++)
-            {
-                x[i] += s->xb2[i];
-            }
+        // final matmul to get the output of the ffn
+        matmul(s->xb, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim);
 
-            // ffn rmsnorm
-            rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim);
-
-            // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-            // first calculate self.w1(x) and self.w3(x)
-            matmul(s->hb, s->xb, w->w1 + l * dim * hidden_dim, dim, hidden_dim);
-            matmul(s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim);
-
-            // SwiGLU non-linearity
-            for (int i = 0; i < hidden_dim; i++)
-            {
-                v4sf val = s->hb[i];
-                // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-                val *= (1.0f / (1.0f + expf(-val)));
-                // elementwise multiply with w3(x)
-                val *= s->hb2[i];
-                s->hb[i] = val;
-            }
-
-            // final matmul to get the output of the ffn
-            matmul(s->xb, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim);
-
-            // residual connection
-            for (int i = 0; i < dim; i++)
-            {
-                x[i] += s->xb[i];
-            }
+        // residual connection
+        for (int i = 0; i < dim; i++)
+        {
+            x[i] += s->xb[i];
         }
     }
 
@@ -913,7 +719,7 @@ int sample_topp(v4sf *probabilities, int n, v4sf topp, ProbIndex *probindex, v4s
     return probindex[last_idx].index; // in case of rounding errors
 }
 
-void build_sampler(Sampler *sampler, int vocab_size, v4sf temperature, v4sf topp, unsigned long long rng_seed)
+void build_sampler(Sampler *sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed)
 {
     sampler->vocab_size = vocab_size;
     sampler->temperature = temperature;
