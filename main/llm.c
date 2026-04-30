@@ -231,12 +231,6 @@ void matmul(v4sf *xout, v4sf *x, v4sf *w, int n, int d)
 
 v4sf *forward(Transformer *transformer, int token, int pos)
 {
-    /* Yield once per forward() so IDLE0 runs and resets the Task WDT.
-     * vTaskDelay(1) blocks for one tick (~10 ms at 100 Hz), which is
-     * enough for IDLE0 to be scheduled. vTaskDelay(0)/taskYIELD() do NOT
-     * feed the WDT because IDLE has lower priority than this task. */
-    vTaskDelay(1);
-
     ESP_LOGD(TAG, "ram available: %lu", esp_get_free_heap_size());
 
     // a few convenience variables
@@ -432,6 +426,11 @@ void free_tokenizer(Tokenizer *t)
 
 char *decode(Tokenizer *t, int prev_token, int token)
 {
+    /* Bounds-check the token id so a glitchy logit (e.g. NaN propagation in
+     * sampling) cannot dereference random memory via t->vocab[token]. */
+    if (token < 0 || token >= t->vocab_size) {
+        return "";
+    }
     char *piece = t->vocab[token];
     // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
     if (prev_token == 1 && piece[0] == ' ')
@@ -690,6 +689,11 @@ int sample_topp(v4sf *probabilities, int n, v4sf topp, ProbIndex *probindex, v4s
             n0++;
         }
     }
+    /* If logits went to NaN/Inf no candidate passed the cutoff. Fall back to
+     * a deterministic safe choice so the caller never receives an OOB token. */
+    if (n0 == 0) {
+        return 0;
+    }
     qsort(probindex, n0, sizeof(ProbIndex), compare);
 
     // truncate the list where cumulative probability exceeds topp
@@ -855,6 +859,11 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         {
             start = time_in_ms();
         }
+
+        /* Yield one tick so IDLE0 runs on CPU0, resetting the Task WDT.
+         * Placed here (after decode/print, before next forward) so the
+         * stack canary check fires when the full call stack is unwound. */
+        vTaskDelay(1);
     }
     printf("\n");
 
